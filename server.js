@@ -1,0 +1,499 @@
+const path           = require('path');
+require('dotenv').config();
+const express        = require('express');
+const cors           = require('cors');
+const mysql          = require('mysql2/promise');
+const authMiddleware = require('./middleware/authMiddleware');
+const authRouter     = require('./routes/auth');
+const adminRouter    = require('./routes/admin');
+const mediaRouter    = require('./routes/media');
+const contentRouter  = require('./routes/content');
+const publicRouter   = require('./routes/public');
+const departmentHeadRouter  = require('./routes/departmentHead');
+const departmentReviewsRouter = require('./routes/departmentReviews');
+const { publicFacultiesRouter, adminFacultiesRouter } = require('./routes/faculties');
+
+const {
+  PORT        = 5000,
+  DB_HOST     = 'localhost',
+  DB_PORT     = 3306,
+  DB_USER     = 'root',
+  DB_PASSWORD = 'root',
+  DB_NAME     = 'wollo-info-hub',
+  CORS_ORIGIN = '*',
+} = process.env;
+
+const app = express();
+app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',') }));
+app.use(express.json({ limit: '2mb' }));
+
+// ── Pool ────────────────────────────────────────────────────
+const pool = mysql.createPool({
+  host: DB_HOST, port: Number(DB_PORT),
+  user: DB_USER, password: DB_PASSWORD, database: DB_NAME,
+  waitForConnections: true, connectionLimit: 10, queueLimit: 0,
+  dateStrings: true,
+});
+
+
+
+
+// Adds a column only when it is missing (safe to re-run)
+async function addColumnIfMissing(table, column, definition) {
+  const [found] = await pool.query(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+    [DB_NAME, table, column]
+  );
+  if (!found.length) {
+    await pool.query(`ALTER TABLE \`${table}\` ADD COLUMN \`${column}\` ${definition}`);
+    console.log(`Migration: added ${column} to ${table}.`);
+  }
+}
+
+// ── Ensure all account + content tables exist ───────────────
+async function ensureTables() {
+  // users table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id            INT          NOT NULL AUTO_INCREMENT,
+      full_name     VARCHAR(120) NOT NULL,
+      email         VARCHAR(180) NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      avatar_url    VARCHAR(255)     NULL DEFAULT NULL,
+      role          VARCHAR(20)  NOT NULL DEFAULT 'user',
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_users_email (email)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // Ensure avatar_url column exists
+  const [cols] = await pool.query(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users' AND COLUMN_NAME = 'avatar_url'`,
+    [DB_NAME]
+  );
+  if (!cols.length) {
+    await pool.query(`ALTER TABLE users ADD COLUMN avatar_url VARCHAR(255) NULL DEFAULT NULL`);
+    console.log('Migration: added avatar_url to users.');
+  }
+
+  // Ensure role column exists
+  const [roleCols] = await pool.query(
+    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users' AND COLUMN_NAME = 'role'`,
+    [DB_NAME]
+  );
+  if (!roleCols.length) {
+    await pool.query(`ALTER TABLE users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'user'`);
+    console.log('Migration: added role column to users.');
+  }
+
+  // ── Content Manager tables ──────────────────────────────────
+
+  // media_folders (must come before media)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS media_folders (
+      id         INT          NOT NULL AUTO_INCREMENT,
+      name       VARCHAR(200) NOT NULL,
+      parent_id  INT              NULL DEFAULT NULL,
+      created_at DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_mf_parent (parent_id),
+      CONSTRAINT fk_mf_parent FOREIGN KEY (parent_id)
+        REFERENCES media_folders(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // media
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS media (
+      id            INT          NOT NULL AUTO_INCREMENT,
+      original_name VARCHAR(255) NOT NULL,
+      stored_name   VARCHAR(255) NOT NULL,
+      mime_type     VARCHAR(120) NOT NULL,
+      size          INT          NOT NULL DEFAULT 0,
+      type          ENUM('image','file','folder-asset') NOT NULL DEFAULT 'file',
+      folder_id     INT              NULL DEFAULT NULL,
+      url           VARCHAR(512) NOT NULL,
+      uploaded_by   INT          NOT NULL,
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_media_folder   (folder_id),
+      KEY idx_media_uploader (uploaded_by),
+      CONSTRAINT fk_media_folder   FOREIGN KEY (folder_id)   REFERENCES media_folders(id) ON DELETE SET NULL,
+      CONSTRAINT fk_media_uploader FOREIGN KEY (uploaded_by) REFERENCES users(id)          ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // sections
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sections (
+      id          INT          NOT NULL AUTO_INCREMENT,
+      slug        VARCHAR(60)  NOT NULL,
+      title       VARCHAR(200) NOT NULL,
+      description TEXT             NULL,
+      sort_order  INT          NOT NULL DEFAULT 0,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_sections_slug (slug)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // seed the three sections (safe to re-run)
+  await pool.query(`
+    INSERT IGNORE INTO sections (slug, title, description, sort_order) VALUES
+      ('motivation',  'Motivation',   'Motivational stories and advice for students.', 1),
+      ('opportunity', 'Opportunities','Clubs, programs and activities at Wollo University.', 2),
+      ('department',  'Departments',  'Academic departments and faculties.', 3);
+  `);
+
+  // content_items
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS content_items (
+      id             INT          NOT NULL AUTO_INCREMENT,
+      section_id     INT          NOT NULL,
+      title          VARCHAR(255) NOT NULL,
+      body           LONGTEXT         NULL,
+      status         ENUM('draft','published','archived') NOT NULL DEFAULT 'draft',
+      cover_media_id INT              NULL DEFAULT NULL,
+      sort_order     INT          NOT NULL DEFAULT 0,
+      created_by     INT          NOT NULL,
+      created_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at     DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      published_at   DATETIME         NULL DEFAULT NULL,
+      PRIMARY KEY (id),
+      KEY idx_ci_section (section_id),
+      KEY idx_ci_status  (status),
+      KEY idx_ci_creator (created_by),
+      CONSTRAINT fk_ci_section FOREIGN KEY (section_id)     REFERENCES sections(id)    ON DELETE RESTRICT,
+      CONSTRAINT fk_ci_cover   FOREIGN KEY (cover_media_id) REFERENCES media(id)       ON DELETE SET NULL,
+      CONSTRAINT fk_ci_creator FOREIGN KEY (created_by)     REFERENCES users(id)       ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // content_media (gallery)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS content_media (
+      content_id INT NOT NULL,
+      media_id   INT NOT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      PRIMARY KEY (content_id, media_id),
+      KEY idx_cm_media (media_id),
+      CONSTRAINT fk_cm_content FOREIGN KEY (content_id) REFERENCES content_items(id) ON DELETE CASCADE,
+      CONSTRAINT fk_cm_media   FOREIGN KEY (media_id)   REFERENCES media(id)          ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // content_versions
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS content_versions (
+      id         INT      NOT NULL AUTO_INCREMENT,
+      content_id INT      NOT NULL,
+      title      VARCHAR(255) NOT NULL,
+      body       LONGTEXT     NULL,
+      edited_by  INT      NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_cv_content (content_id),
+      KEY idx_cv_editor  (edited_by),
+      CONSTRAINT fk_cv_content FOREIGN KEY (content_id) REFERENCES content_items(id) ON DELETE CASCADE,
+      CONSTRAINT fk_cv_editor  FOREIGN KEY (edited_by)  REFERENCES users(id)          ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // ── Department Head tables (NEW) ────────────────────────────
+
+  // departments (if you already had this table, the missing columns are added below)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS departments (
+      id              INT          NOT NULL AUTO_INCREMENT,
+      name            VARCHAR(150) NOT NULL,
+      description     TEXT             NULL,
+      graduates_count INT          NOT NULL DEFAULT 0,
+      duration_years  INT          NOT NULL DEFAULT 4,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_departments_name (name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+  await addColumnIfMissing('departments', 'description',     'TEXT NULL');
+  await addColumnIfMissing('departments', 'graduates_count', 'INT NOT NULL DEFAULT 0');
+  await addColumnIfMissing('departments', 'duration_years',  'INT NOT NULL DEFAULT 4');
+
+  // department_heads (one head per login, linked to one department)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS department_heads (
+      id            INT          NOT NULL AUTO_INCREMENT,
+      name          VARCHAR(120) NOT NULL,
+      email         VARCHAR(160) NOT NULL,
+      password_hash VARCHAR(255) NOT NULL,
+      department_id INT          NOT NULL,
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_dh_email (email),
+      KEY idx_dh_department (department_id),
+      CONSTRAINT fk_dh_department FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // department_courses
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS department_courses (
+      id            INT          NOT NULL AUTO_INCREMENT,
+      department_id INT          NOT NULL,
+      course_name   VARCHAR(200) NOT NULL,
+      prerequisites VARCHAR(300) NOT NULL DEFAULT '',
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_dc_department (department_id),
+      CONSTRAINT fk_dc_department FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // department_interests (students who want a department; student_id = users.id)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS department_interests (
+      id            INT      NOT NULL AUTO_INCREMENT,
+      student_id    INT      NOT NULL,
+      department_id INT      NOT NULL,
+      created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_di_student_dept (student_id, department_id),
+      KEY idx_di_department (department_id),
+      CONSTRAINT fk_di_student    FOREIGN KEY (student_id)    REFERENCES users(id)       ON DELETE CASCADE,
+      CONSTRAINT fk_di_department FOREIGN KEY (department_id) REFERENCES departments(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // department_content (opportunities, motivation, library documents added by heads)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS department_content (
+      id            INT          NOT NULL AUTO_INCREMENT,
+      department_id INT          NOT NULL,
+      head_id       INT          NOT NULL,
+      type          ENUM('opportunity','motivation','document') NOT NULL,
+      title         VARCHAR(200) NOT NULL,
+      body          TEXT             NULL,
+      link_url      VARCHAR(500) NOT NULL DEFAULT '',
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_dcont_department (department_id),
+      CONSTRAINT fk_dcont_department FOREIGN KEY (department_id) REFERENCES departments(id)      ON DELETE CASCADE,
+      CONSTRAINT fk_dcont_head       FOREIGN KEY (head_id)       REFERENCES department_heads(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  // department_reviews (ratings from students/graduates/visitors)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS department_reviews (
+      id            INT          NOT NULL AUTO_INCREMENT,
+      department_id VARCHAR(100) NOT NULL,
+      name          VARCHAR(120) NOT NULL,
+      role          VARCHAR(20)  NOT NULL DEFAULT 'Student',
+      rating        TINYINT      NOT NULL,
+      comment       TEXT         NOT NULL,
+      created_at    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_dr_dept    (department_id),
+      KEY idx_dr_created (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  `);
+
+  console.log('✓ All tables ready (users + content manager + department heads + reviews)');
+}
+
+// ── Schema introspection ────────────────────────────────────
+let schema = {};
+
+async function loadSchema() {
+  const [rows] = await pool.query(
+    `SELECT TABLE_NAME, COLUMN_NAME, COLUMN_KEY, EXTRA
+       FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = ?
+      ORDER BY TABLE_NAME, ORDINAL_POSITION`,
+    [DB_NAME]
+  );
+  const next = {};
+  for (const r of rows) {
+    const t = r.TABLE_NAME;
+    if (!next[t]) next[t] = { columns: new Set(), primaryKey: null, pkCount: 0, autoIncrement: new Set() };
+    next[t].columns.add(r.COLUMN_NAME);
+    if (r.COLUMN_KEY === 'PRI') { next[t].pkCount++; if (!next[t].primaryKey) next[t].primaryKey = r.COLUMN_NAME; }
+    if (String(r.EXTRA).includes('auto_increment')) next[t].autoIncrement.add(r.COLUMN_NAME);
+  }
+  schema = next;
+  return Object.keys(schema);
+}
+
+// ── Helpers ─────────────────────────────────────────────────
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+class HttpError extends Error {
+  constructor(status, msg) { super(msg); this.status = status; }
+}
+
+// These tables are never accessible via the generic /api/:table routes.
+// department_heads holds password hashes, so it MUST stay blocked.
+const BLOCKED_TABLES = new Set([
+  'users', 'sections', 'content_items', 'content_media',
+  'content_versions', 'media', 'media_folders',
+  'department_heads', 'department_interests', 'department_content', 'department_courses',
+  'faculties', 'departments',
+]);
+
+function getTable(name) {
+  if (BLOCKED_TABLES.has(name)) throw new HttpError(403, `Table "${name}" is not accessible.`);
+  const t = schema[name];
+  if (!t) throw new HttpError(404, `Table "${name}" not found`);
+  return t;
+}
+
+function requireSinglePk(table, name) {
+  if (!table.primaryKey || table.pkCount !== 1)
+    throw new HttpError(400, `Table "${name}" needs exactly one primary key`);
+  return table.primaryKey;
+}
+
+function pickColumns(table, body) {
+  const data = {};
+  for (const [k, v] of Object.entries(body || {})) {
+    if (k === 'password_hash') continue;  // never writable via generic routes
+    if (table.columns.has(k)) data[k] = v;
+  }
+  return data;
+}
+
+// ── Static uploads ───────────────────────────────────────────
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// ── Mount auth + admin + content routers ─────────────────────
+// (all routers are mounted BEFORE the generic /api/:table routes below)
+app.use('/api/auth',            authRouter(pool));
+app.use('/api/admin',           adminRouter(pool));
+app.use('/api/admin',           adminFacultiesRouter(pool));   // faculties & departments CRUD
+app.use('/api/media',           mediaRouter(pool));
+app.use('/api/content',         contentRouter(pool));
+app.use('/api/public',          publicRouter(pool));
+app.use('/api/public',          publicFacultiesRouter(pool));  // GET /api/public/faculties
+app.use('/api/department-head', departmentHeadRouter(pool));
+app.use('/api/departments',     departmentReviewsRouter(pool));
+
+// ── Health ───────────────────────────────────────────────────
+app.get('/api/health', asyncHandler(async (_req, res) => {
+  await pool.query('SELECT 1');
+  res.json({ status: 'ok', database: DB_NAME, time: new Date().toISOString() });
+}));
+
+app.get('/api/tables', (_req, res) => {
+  res.json(
+    Object.entries(schema)
+      .filter(([n]) => !BLOCKED_TABLES.has(n))
+      .map(([n, t]) => ({ name: n, primaryKey: t.primaryKey, columns: [...t.columns] }))
+  );
+});
+
+app.post('/api/schema/refresh', asyncHandler(async (_req, res) => {
+  const tables = await loadSchema();
+  res.json({ tables: tables.filter((t) => !BLOCKED_TABLES.has(t)) });
+}));
+
+// ── Generic read (public) ────────────────────────────────────
+app.get('/api/:table', asyncHandler(async (req, res) => {
+  const name  = req.params.table;
+  const table = getTable(name);
+  const { limit = 50, offset = 0, sort, order = 'asc', search, ...filters } = req.query;
+  const safeLimit  = Math.min(Math.max(parseInt(limit, 10)  || 50, 1), 500);
+  const safeOffset = Math.max(parseInt(offset, 10) || 0, 0);
+  const where = []; const params = [];
+  for (const [col, val] of Object.entries(filters))
+    if (table.columns.has(col)) { where.push(`${pool.escapeId(col)} = ?`); params.push(val); }
+  if (search) {
+    const like = [...table.columns].map((c) => `${pool.escapeId(c)} LIKE ?`);
+    if (like.length) { where.push(`(${like.join(' OR ')})`); like.forEach(() => params.push(`%${search}%`)); }
+  }
+  const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  const orderSql = sort && table.columns.has(sort)
+    ? `ORDER BY ${pool.escapeId(sort)} ${String(order).toLowerCase() === 'desc' ? 'DESC' : 'ASC'}`
+    : '';
+  const tSql = pool.escapeId(name);
+  const [rows] = await pool.query(`SELECT * FROM ${tSql} ${whereSql} ${orderSql} LIMIT ? OFFSET ?`, [...params, safeLimit, safeOffset]);
+  const [[{ total }]] = await pool.query(`SELECT COUNT(*) AS total FROM ${tSql} ${whereSql}`, params);
+  res.json({ data: rows, total, limit: safeLimit, offset: safeOffset });
+}));
+
+app.get('/api/:table/:id', asyncHandler(async (req, res) => {
+  const name  = req.params.table;
+  const table = getTable(name);
+  const pk    = requireSinglePk(table, name);
+  const [rows] = await pool.query(
+    `SELECT * FROM ${pool.escapeId(name)} WHERE ${pool.escapeId(pk)} = ? LIMIT 1`, [req.params.id]
+  );
+  if (!rows.length) throw new HttpError(404, 'Record not found');
+  res.json(rows[0]);
+}));
+
+// ── Generic write (protected) ────────────────────────────────
+app.post('/api/:table', authMiddleware, asyncHandler(async (req, res) => {
+  const name  = req.params.table;
+  const table = getTable(name);
+  const data  = pickColumns(table, req.body);
+  if (!Object.keys(data).length) throw new HttpError(400, 'No valid columns provided');
+  const [result] = await pool.query(`INSERT INTO ${pool.escapeId(name)} SET ?`, [data]);
+  let created = { ...data };
+  if (table.primaryKey && table.pkCount === 1) {
+    const id = data[table.primaryKey] ?? result.insertId;
+    const [rows] = await pool.query(`SELECT * FROM ${pool.escapeId(name)} WHERE ${pool.escapeId(table.primaryKey)} = ? LIMIT 1`, [id]);
+    if (rows.length) created = rows[0];
+  }
+  res.status(201).json(created);
+}));
+
+app.put('/api/:table/:id', authMiddleware, asyncHandler(async (req, res) => {
+  const name  = req.params.table;
+  const table = getTable(name);
+  const pk    = requireSinglePk(table, name);
+  const data  = pickColumns(table, req.body);
+  delete data[pk];
+  if (!Object.keys(data).length) throw new HttpError(400, 'No valid columns provided');
+  const [result] = await pool.query(`UPDATE ${pool.escapeId(name)} SET ? WHERE ${pool.escapeId(pk)} = ?`, [data, req.params.id]);
+  if (!result.affectedRows) throw new HttpError(404, 'Record not found');
+  const [rows] = await pool.query(`SELECT * FROM ${pool.escapeId(name)} WHERE ${pool.escapeId(pk)} = ? LIMIT 1`, [req.params.id]);
+  res.json(rows[0]);
+}));
+
+app.delete('/api/:table/:id', authMiddleware, asyncHandler(async (req, res) => {
+  const name  = req.params.table;
+  const table = getTable(name);
+  const pk    = requireSinglePk(table, name);
+  const [result] = await pool.query(`DELETE FROM ${pool.escapeId(name)} WHERE ${pool.escapeId(pk)} = ?`, [req.params.id]);
+  if (!result.affectedRows) throw new HttpError(404, 'Record not found');
+  res.json({ success: true });
+}));
+
+// ── Error handlers ───────────────────────────────────────────
+app.use((req, res) => res.status(404).json({ error: `Route ${req.method} ${req.path} not found` }));
+
+app.use((err, _req, res, _next) => {
+  const status = err.status || (err.code === 'ER_DUP_ENTRY' ? 409 : 500);
+  if (status === 500) console.error(err);
+  res.status(status).json({
+    error: err.status ? err.message : err.code === 'ER_DUP_ENTRY' ? 'Duplicate entry' : 'Internal server error',
+    ...(process.env.NODE_ENV !== 'production' && status === 500 ? { detail: err.message } : {}),
+  });
+});
+
+// ── Start ────────────────────────────────────────────────────
+(async () => {
+  try {
+    await ensureTables();
+    const tables = await loadSchema();
+    console.log(`✓ MySQL "${DB_NAME}" @ ${DB_HOST}:${DB_PORT}`);
+    console.log(`✓ Tables (${tables.length}): ${tables.join(', ') || 'none'}`);
+    app.listen(PORT, () => console.log(`✓ Server → http://localhost:${PORT}`));
+  } catch (err) {
+    console.error('Failed to start:', err.message);
+    process.exit(1);
+  }
+})();
+
+process.on('SIGINT', async () => { await pool.end(); process.exit(0); });
