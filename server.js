@@ -24,7 +24,7 @@ const {
 } = process.env;
 
 const app = express();
-app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',') }));
+app.use(cors({ origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',').map((s) => s.trim()) }));
 app.use(express.json({ limit: '2mb' }));
 
 // ── Pool ────────────────────────────────────────────────────
@@ -35,8 +35,20 @@ const pool = mysql.createPool({
   dateStrings: true,
 });
 
-
-
+// Creates the database itself if it does not exist yet (safe to re-run)
+async function ensureDatabase() {
+  const conn = await mysql.createConnection({
+    host: DB_HOST, port: Number(DB_PORT),
+    user: DB_USER, password: DB_PASSWORD,
+  });
+  try {
+    await conn.query(
+      `CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`
+    );
+  } finally {
+    await conn.end();
+  }
+}
 
 // Adds a column only when it is missing (safe to re-run)
 async function addColumnIfMissing(table, column, definition) {
@@ -68,27 +80,8 @@ async function ensureTables() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // Ensure avatar_url column exists
-  const [cols] = await pool.query(
-    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users' AND COLUMN_NAME = 'avatar_url'`,
-    [DB_NAME]
-  );
-  if (!cols.length) {
-    await pool.query(`ALTER TABLE users ADD COLUMN avatar_url VARCHAR(255) NULL DEFAULT NULL`);
-    console.log('Migration: added avatar_url to users.');
-  }
-
-  // Ensure role column exists
-  const [roleCols] = await pool.query(
-    `SELECT COLUMN_NAME FROM information_schema.COLUMNS
-      WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'users' AND COLUMN_NAME = 'role'`,
-    [DB_NAME]
-  );
-  if (!roleCols.length) {
-    await pool.query(`ALTER TABLE users ADD COLUMN role VARCHAR(20) NOT NULL DEFAULT 'user'`);
-    console.log('Migration: added role column to users.');
-  }
+  await addColumnIfMissing('users', 'avatar_url', 'VARCHAR(255) NULL DEFAULT NULL');
+  await addColumnIfMissing('users', 'role',       "VARCHAR(20) NOT NULL DEFAULT 'user'");
 
   // ── Content Manager tables ──────────────────────────────────
 
@@ -202,7 +195,7 @@ async function ensureTables() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
-  // ── Department Head tables (NEW) ────────────────────────────
+  // ── Department Head tables ──────────────────────────────────
 
   // departments (if you already had this table, the missing columns are added below)
   await pool.query(`
@@ -485,6 +478,7 @@ app.use((err, _req, res, _next) => {
 // ── Start ────────────────────────────────────────────────────
 (async () => {
   try {
+    await ensureDatabase();
     await ensureTables();
     const tables = await loadSchema();
     console.log(`✓ MySQL "${DB_NAME}" @ ${DB_HOST}:${DB_PORT}`);
@@ -492,6 +486,12 @@ app.use((err, _req, res, _next) => {
     app.listen(PORT, () => console.log(`✓ Server → http://localhost:${PORT}`));
   } catch (err) {
     console.error('Failed to start:', err.message);
+    if (err.code === 'ECONNREFUSED')
+      console.error(`→ MySQL is not reachable on ${DB_HOST}:${DB_PORT}. Start MAMP and check the MySQL port in MAMP preferences.`);
+    else if (err.code === 'ER_ACCESS_DENIED_ERROR')
+      console.error(`→ MySQL rejected user "${DB_USER}". Check DB_USER / DB_PASSWORD in .env.`);
+    else if (err.code === 'ER_BAD_DB_ERROR')
+      console.error(`→ Database "${DB_NAME}" does not exist and could not be created.`);
     process.exit(1);
   }
 })();
