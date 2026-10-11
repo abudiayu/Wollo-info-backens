@@ -1,5 +1,9 @@
 .env
 .env.example
+<<<<<<< HEAD
 node_modules/node_modules/
 .env
 uploads/
+=======
+node_modules/
+>>>>>>> dab14a14950bd788165d9dae4d8ba20822f520aa

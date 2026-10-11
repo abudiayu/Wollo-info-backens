@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node --use-system-ca src/server.js",
     "dev": "node --use-system-ca src/server.js",
+    "dev:mysql": "nodemon server.js",
     "make-admin": "node --use-system-ca src/scripts/makeAdmin.js",
     "migrate-mysql": "node --use-system-ca src/scripts/migrateFromMysql.js"
   },
