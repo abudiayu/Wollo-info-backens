@@ -1,0 +1,28 @@
+# Supabase local dev config — used by `supabase start` (optional for local dev)
+[project]
+id = "akxrrdmiclnixgommfhh"
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[studio]
+port = 54323
+
+[api]
+port = 54321
+
+[auth]
+site_url = "http://localhost:5173"
+additional_redirect_urls = ["http://localhost:3000"]
+jwt_expiry = 3600
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+double_confirm_changes = true
+enable_confirmations = false
+
+[storage]
+enabled = true
