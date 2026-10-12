@@ -1,61 +1,31 @@
+'use strict';
 /**
- * src/routes/public.js
+ * src/routes/public.js — unauthenticated read-only routes
  *
- * Unauthenticated read-only routes — only published/active data.
+ * GET /api/public/health                  — quick liveness check
+ * GET /api/public/departments             — flat department list (signup form)
+ * GET /api/public/departments/:id/reviews — published reviews for one dept
+ * GET /api/public/faculties               — faculties + nested departments (nav)
+ * GET /api/public/motivations             — published motivations
+ * GET /api/public/opportunities           — published opportunities
+ * GET /api/public/sections/:slug          — published content items by section
  *
- * GET /api/public/sections/:slug   — published content items by section
- * GET /api/public/faculties        — all faculties + departments (for nav bar)
- * GET /api/public/motivations      — published motivations (overview page)
- * GET /api/public/opportunities    — published opportunities
- * GET /api/public/departments/:id/reviews  — reviews (no auth)
+ * All routes use the service-role adminClient so RLS never blocks them.
+ * No auth middleware is applied anywhere in this file.
  */
 
-'use strict';
-
-const express        = require('express');
+const express       = require('express');
 const { adminClient } = require('../config/supabase');
 
 const router = express.Router();
 
-// ── GET /api/public/sections/:slug ───────────────────────────
-router.get('/sections/:slug', async (req, res) => {
-  const { data: section } = await adminClient
-    .from('sections')
-    .select('*')
-    .eq('slug', req.params.slug)
-    .maybeSingle();
+// ── Quick health ping (useful for Vercel → Render cold-start checks) ──
+router.get('/health', (_req, res) => res.json({ ok: true }));
 
-  if (!section) {
-    return res.status(404).json({ error: `Section "${req.params.slug}" not found.`, code: 'NOT_FOUND' });
-  }
-
-  const { data: items, error } = await adminClient
-    .from('content_items')
-    .select('id, title, body, published_at, sort_order, cover:media_items(url, original_name)')
-    .eq('section_id', section.id)
-    .eq('status', 'published')
-    .order('sort_order', { ascending: true })
-    .order('published_at', { ascending: false });
-
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
-
-  // Attach gallery to each item
-  for (const item of items || []) {
-    const { data: gallery } = await adminClient
-      .from('content_media')
-      .select('media_items(id, url, original_name, mime_type, type)')
-      .eq('content_id', item.id)
-      .order('sort_order', { ascending: true });
-
-    item.gallery = (gallery || []).map(g => g.media_items).filter(Boolean);
-  }
-
-  return res.json({ section, items: items || [] });
-});
-
-// ── GET /api/public/departments/:id/reviews ──────────────────
-// MUST be before the flat /departments route so Express doesn't
-// match /:id as a department list request.
+// ── GET /api/public/departments/:id/reviews ──────────────────────
+// IMPORTANT: this specific route MUST be registered BEFORE the
+// generic /departments route, otherwise Express matches /departments
+// as the flat-list handler and the :id param never fires.
 router.get('/departments/:id/reviews', async (req, res) => {
   const { data, error } = await adminClient
     .from('department_reviews')
@@ -65,7 +35,7 @@ router.get('/departments/:id/reviews', async (req, res) => {
     .order('created_at', { ascending: false })
     .limit(200);
 
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
+  if (error) return res.status(500).json({ error: error.message });
 
   const reviews = (data || []).map(r => ({
     id:      r.id,
@@ -79,106 +49,157 @@ router.get('/departments/:id/reviews', async (req, res) => {
   return res.json({ reviews });
 });
 
-// ── GET /api/public/departments ──────────────────────────────
-// Flat list of all active departments — used by the registration form.
-// Two separate queries (no join) so the fetch shim works reliably.
+// ── GET /api/public/departments ───────────────────────────────────
+// Returns { departments: [ { id, name, name_en, name_am, slug,
+//                             faculty_id, faculty_name } ] }
+// Uses two separate queries (no PostgREST join syntax) so the
+// lightweight fetch shim works identically to the full Supabase SDK.
 router.get('/departments', async (_req, res) => {
-  const { data: depts, error } = await adminClient
-    .from('departments')
-    .select('id, name_en, name_am, slug, faculty_id, is_active')
-    .eq('is_active', true)
-    .order('name_en', { ascending: true });
+  try {
+    // 1. Fetch departments
+    const { data: depts, error: dErr } = await adminClient
+      .from('departments')
+      .select('id, name_en, name_am, slug, faculty_id, is_active')
+      .eq('is_active', true)
+      .order('name_en', { ascending: true });
 
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
-  if (!depts || depts.length === 0) return res.json([]);
+    if (dErr) {
+      console.error('[public/departments] dept query error:', dErr.message);
+      return res.status(500).json({ error: dErr.message });
+    }
 
-  // Fetch faculty names separately so the shim's simple fetch works
-  const facultyIds = [...new Set(depts.map(d => d.faculty_id).filter(Boolean))];
-  let facMap = {};
-  if (facultyIds.length > 0) {
-    const { data: facs } = await adminClient
-      .from('faculties')
-      .select('id, name_en')
-      .in('id', facultyIds);
-    facMap = Object.fromEntries((facs || []).map(f => [f.id, f.name_en]));
+    if (!depts || depts.length === 0) {
+      return res.json({ departments: [] });
+    }
+
+    // 2. Fetch faculty names for the departments we got
+    const facultyIds = [...new Set(depts.map(d => d.faculty_id).filter(Boolean))];
+    let facMap = {};
+    if (facultyIds.length > 0) {
+      const { data: facs } = await adminClient
+        .from('faculties')
+        .select('id, name_en')
+        .in('id', facultyIds);
+      facMap = Object.fromEntries((facs || []).map(f => [f.id, f.name_en]));
+    }
+
+    const departments = depts.map(d => ({
+      id:           d.id,
+      name:         d.name_en,      // convenient short alias
+      name_en:      d.name_en,
+      name_am:      d.name_am  || null,
+      slug:         d.slug,
+      faculty_id:   d.faculty_id   || null,
+      faculty_name: d.faculty_id   ? (facMap[d.faculty_id] || null) : null,
+    }));
+
+    return res.json({ departments });
+  } catch (err) {
+    console.error('[public/departments] unexpected error:', err.message);
+    return res.status(500).json({ error: 'Failed to load departments.' });
   }
-
-  const result = depts.map(d => ({
-    id:           d.id,
-    name_en:      d.name_en,
-    name_am:      d.name_am || null,
-    name:         d.name_en,
-    slug:         d.slug,
-    faculty_id:   d.faculty_id,
-    faculty_name: d.faculty_id ? (facMap[d.faculty_id] || null) : null,
-  }));
-
-  return res.json(result);
 });
 
-// ── GET /api/public/faculties ─────────────────────────────────
-// Used by the nav bar dropdown — returns all faculties + their departments.
+// ── GET /api/public/faculties ─────────────────────────────────────
+// Returns { success: true, data: [ { ...faculty, departments: [...] } ] }
 router.get('/faculties', async (_req, res) => {
-  const { data: faculties, error: fErr } = await adminClient
-    .from('faculties')
-    .select('id, name_en, name_am, slug, color, image_url, description, sort_order')
-    .order('sort_order', { ascending: true });
+  try {
+    const { data: faculties, error: fErr } = await adminClient
+      .from('faculties')
+      .select('id, name_en, name_am, slug, color, image_url, description, sort_order')
+      .order('sort_order', { ascending: true });
 
-  if (fErr) return res.status(500).json({ error: fErr.message, code: 'DB_ERROR' });
+    if (fErr) return res.status(500).json({ error: fErr.message });
 
-  const { data: departments } = await adminClient
-    .from('departments')
-    .select('id, faculty_id, name_en, name_am, slug, description, sort_order')
-    .eq('is_active', true)
-    .order('sort_order', { ascending: true });
+    const { data: departments } = await adminClient
+      .from('departments')
+      .select('id, faculty_id, name_en, name_am, slug, description, sort_order')
+      .eq('is_active', true)
+      .order('sort_order', { ascending: true });
 
-  const deptMap = {};
-  for (const d of departments || []) {
-    if (!deptMap[d.faculty_id]) deptMap[d.faculty_id] = [];
-    deptMap[d.faculty_id].push(d);
+    const deptMap = {};
+    for (const d of departments || []) {
+      if (!deptMap[d.faculty_id]) deptMap[d.faculty_id] = [];
+      deptMap[d.faculty_id].push(d);
+    }
+
+    const result = (faculties || []).map(f => ({
+      ...f,
+      departments: deptMap[f.id] || [],
+    }));
+
+    return res.json({ success: true, data: result });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
-
-  const result = (faculties || []).map(f => ({
-    ...f,
-    departments: deptMap[f.id] || [],
-  }));
-
-  return res.json({ success: true, data: result });
 });
 
-// ── GET /api/public/motivations ───────────────────────────────
+// ── GET /api/public/motivations ───────────────────────────────────
 router.get('/motivations', async (req, res) => {
-  const { department_id } = req.query;
+  try {
+    const { department_id } = req.query;
+    let query = adminClient
+      .from('motivations')
+      .select('id, title, details, media_url, department_id, created_at')
+      .eq('status', 'published')
+      .order('created_at', { ascending: false });
 
-  let query = adminClient
-    .from('motivations')
-    .select('id, title, details, media_url, department_id, created_at, departments(name_en, slug)')
-    .eq('status', 'published')
-    .order('created_at', { ascending: false });
+    if (department_id) query = query.eq('department_id', department_id);
 
-  if (department_id) query = query.eq('department_id', department_id);
-
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
-  return res.json(data || []);
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json(data || []);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
-// ── GET /api/public/opportunities ────────────────────────────
+// ── GET /api/public/opportunities ────────────────────────────────
 router.get('/opportunities', async (req, res) => {
-  const { department_id } = req.query;
+  try {
+    const { department_id } = req.query;
+    let query = adminClient
+      .from('opportunities')
+      .select('id, title, details, link, deadline, department_id, created_at')
+      .eq('status', 'published')
+      .order('created_at', { ascending: false });
 
-  let query = adminClient
-    .from('opportunities')
-    .select('id, title, details, link, deadline, department_id, created_at, departments(name_en, slug)')
-    .eq('status', 'published')
-    .order('created_at', { ascending: false });
+    if (department_id) query = query.eq('department_id', department_id);
 
-  if (department_id) query = query.eq('department_id', department_id);
-
-  const { data, error } = await query;
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
-  return res.json(data || []);
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json(data || []);
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
 });
 
+// ── GET /api/public/sections/:slug ───────────────────────────────
+router.get('/sections/:slug', async (req, res) => {
+  try {
+    const { data: section } = await adminClient
+      .from('sections')
+      .select('*')
+      .eq('slug', req.params.slug)
+      .maybeSingle();
+
+    if (!section) {
+      return res.status(404).json({ error: `Section "${req.params.slug}" not found.` });
+    }
+
+    const { data: items, error } = await adminClient
+      .from('content_items')
+      .select('id, title, body, published_at, sort_order')
+      .eq('section_id', section.id)
+      .eq('status', 'published')
+      .order('sort_order', { ascending: true })
+      .order('published_at', { ascending: false });
+
+    if (error) return res.status(500).json({ error: error.message });
+    return res.json({ section, items: items || [] });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
