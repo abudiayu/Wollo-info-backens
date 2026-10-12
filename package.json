@@ -4,11 +4,10 @@
   "description": "Wollo Info Hub — Express API backed by Supabase (Postgres + Auth + RLS + Storage)",
   "main": "src/server.js",
   "scripts": {
-    "start": "node --use-system-ca src/server.js",
-    "dev": "node --use-system-ca src/server.js",
-    "dev:mysql": "nodemon server.js",
-    "make-admin": "node --use-system-ca src/scripts/makeAdmin.js",
-    "migrate-mysql": "node --use-system-ca src/scripts/migrateFromMysql.js"
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "make-admin": "node src/scripts/makeAdmin.js",
+    "migrate-mysql": "node src/scripts/migrateFromMysql.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.117.3",
