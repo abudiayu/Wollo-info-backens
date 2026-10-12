@@ -24,16 +24,17 @@ try { morgan    = require('morgan');             } catch { morgan    = null; }
 try { rateLimit = require('express-rate-limit'); } catch { rateLimit = null; }
 
 // ── Route handlers ────────────────────────────────────────────
-const authRouter          = require('./routes/auth');
-const adminRouter         = require('./routes/admin');
-const departmentsRouter   = require('./routes/departments');
-const contentRouter       = require('./routes/content');
-const motivationsRouter   = require('./routes/motivations');
-const opportunitiesRouter = require('./routes/opportunities');
-const mediaRouter         = require('./routes/media');
-const publicRouter        = require('./routes/public');
-const studentsRouter      = require('./routes/students');
-const auditRouter         = require('./routes/audit');
+const authRouter             = require('./routes/auth');
+const adminRouter            = require('./routes/admin');
+const departmentHeadRouter   = require('./routes/departmentHead');
+const departmentsRouter      = require('./routes/departments');
+const contentRouter          = require('./routes/content');
+const motivationsRouter      = require('./routes/motivations');
+const opportunitiesRouter    = require('./routes/opportunities');
+const mediaRouter            = require('./routes/media');
+const publicRouter           = require('./routes/public');
+const studentsRouter         = require('./routes/students');
+const auditRouter            = require('./routes/audit');
 
 const { adminClient } = require('./config/supabase');
 
@@ -101,16 +102,17 @@ app.get('/api/health', async (_req, res) => {
 });
 
 // ── API routes ─────────────────────────────────────────────────
-app.use('/api/auth',          authRouter);
-app.use('/api/admin',         adminRouter);
-app.use('/api/content',       contentRouter);
-app.use('/api/motivations',   motivationsRouter);
-app.use('/api/opportunities', opportunitiesRouter);
-app.use('/api/media',         mediaRouter);
-app.use('/api/students',      studentsRouter);
-app.use('/api/audit',         auditRouter);
-app.use('/api/public',        publicRouter);
-app.use('/api/departments',   departmentsRouter);
+app.use('/api/auth',             authRouter);
+app.use('/api/admin',            adminRouter);
+app.use('/api/department-head',  departmentHeadRouter);
+app.use('/api/content',          contentRouter);
+app.use('/api/motivations',      motivationsRouter);
+app.use('/api/opportunities',    opportunitiesRouter);
+app.use('/api/media',            mediaRouter);
+app.use('/api/students',         studentsRouter);
+app.use('/api/audit',            auditRouter);
+app.use('/api/public',           publicRouter);
+app.use('/api/departments',      departmentsRouter);
 
 // ── 404 ────────────────────────────────────────────────────────
 app.use((req, res) => {
