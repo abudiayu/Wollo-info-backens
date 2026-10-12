@@ -191,11 +191,16 @@ router.post('/login', authLimiter, async (req, res) => {
 
   const role = staffProfile?.role ?? 'student';
 
-  // Audit
-  await adminClient.from('audit_logs').insert({
-    actor_id: authUser.id, action: 'login', table_name: 'auth.users',
-    record_id: authUser.id, new_data: { email: normalEmail, role },
-  }).catch(() => {});
+  // Audit — wrapped in try/catch because the query builder does not return a Promise
+  try {
+    const { error: auditErr } = await adminClient.from('audit_logs').insert({
+      actor_id: authUser.id, action: 'login', table_name: 'auth.users',
+      record_id: authUser.id, new_data: { email: normalEmail, role },
+    });
+    if (auditErr) console.error('[login] audit insert failed:', auditErr.message);
+  } catch (e) {
+    console.error('[login] audit insert threw:', e.message);
+  }
 
   // Build extra fields for students
   let extra = {};

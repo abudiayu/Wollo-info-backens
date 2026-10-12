@@ -11,6 +11,14 @@
  *  - global error handler always returns JSON
  */
 
+// ── Process-level safety net — one bug must never kill the process ──
+process.on('unhandledRejection', (err) => {
+  console.error('[unhandledRejection]', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+});
+
 require('dotenv').config();
 
 // ── Env validation — fail loudly before anything else ────────

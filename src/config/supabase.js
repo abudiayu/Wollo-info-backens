@@ -4,23 +4,11 @@
  * Supabase clients using @supabase/supabase-js if installed,
  * otherwise falls back to a lightweight fetch-based client
  * so the server starts even before npm install is run.
- *
- * TLS fix: Node 24 on Windows doesn't trust the Supabase CA by default.
- * We set NODE_TLS_REJECT_UNAUTHORIZED=0 as an emergency fallback when
- * running in development. Start the server with --use-system-ca for the
- * proper fix (already set in package.json scripts).
  */
 
 'use strict';
 
 require('dotenv').config();
-
-// ── TLS fix for Node 24 on Windows ───────────────────────────
-// The proper fix is --use-system-ca (set in package.json).
-// This env var is a safety net for any direct `node src/server.js` calls.
-if (process.env.NODE_ENV !== 'production') {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-}
 
 const {
   SUPABASE_URL,
