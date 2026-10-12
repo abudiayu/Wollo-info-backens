@@ -1,81 +1,42 @@
-/**
- * makeDepartmentHead.js
- * ---------------------
- * Creates a department + department head account in the database.
- *
- * Usage:
- *   node makeDepartmentHead.js
- *
- * Edit the variables below before running.
- */
-
 require('dotenv').config();
-const mysql  = require('mysql2/promise');
-const bcrypt = require('bcryptjs');
+const { createClient } = require('@supabase/supabase-js');
 
-const DEPT_NAME      = 'Medicine';              // must match your departments table
-const HEAD_NAME      = 'Dr. Abebe Girma';
-const HEAD_EMAIL     = 'head.medicine@wollo.edu.et';
-const HEAD_PASSWORD  = 'WolloMed2025!';         // change this
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { autoRefreshToken: false, persistSession: false } }
+);
+
+const DEPT_NAME = 'Medicine';
+const EMAIL     = 'head.medicine@wollo.edu.et';
+const PASSWORD  = 'WolloMed2025!';   // change this
+const NAME      = 'Dr. Abebe Girma';
 
 (async () => {
-  const db = await mysql.createConnection({
-    host:     process.env.DB_HOST     || 'localhost',
-    port:     Number(process.env.DB_PORT) || 3306,
-    user:     process.env.DB_USER     || 'root',
-    password: process.env.DB_PASSWORD || 'root',
-    database: process.env.DB_NAME     || 'wollo-info-hub',
-  });
-
   try {
-    /* 1. Ensure the department row exists */
-    await db.query(
-      `INSERT IGNORE INTO departments (name) VALUES (?)`,
-      [DEPT_NAME]
-    );
-
-    const [[dept]] = await db.query(
-      'SELECT id FROM departments WHERE name = ? LIMIT 1',
-      [DEPT_NAME]
-    );
-
+    let { data: dept } = await supabase
+      .from('departments').select('id').eq('name', DEPT_NAME).maybeSingle();
     if (!dept) {
-      console.error(`Department "${DEPT_NAME}" not found even after insert.`);
-      process.exit(1);
+      const { data, error } = await supabase
+        .from('departments').insert({ name: DEPT_NAME }).select('id').single();
+      if (error) throw error;
+      dept = data;
     }
 
-    /* 2. Check for existing head with that email */
-    const [[existing]] = await db.query(
-      'SELECT id FROM department_heads WHERE email = ? LIMIT 1',
-      [HEAD_EMAIL]
-    );
+    const { data: created, error: authErr } = await supabase.auth.admin.createUser({
+      email: EMAIL, password: PASSWORD, email_confirm: true,
+      user_metadata: { full_name: NAME },
+    });
+    if (authErr) throw authErr;
 
-    if (existing) {
-      console.log(`Department head already exists with email: ${HEAD_EMAIL}`);
-      console.log('To reset the password, delete the row and re-run this script.');
-      await db.end();
-      return;
-    }
+    const { error: profErr } = await supabase.from('staff_profiles').insert({
+      user_id: created.user.id, role: 'head', department_id: dept.id,
+    });
+    if (profErr) throw profErr;
 
-    /* 3. Create the head account */
-    const hash = await bcrypt.hash(HEAD_PASSWORD, 12);
-    const [r] = await db.query(
-      `INSERT INTO department_heads (name, email, password_hash, department_id)
-       VALUES (?, ?, ?, ?)`,
-      [HEAD_NAME, HEAD_EMAIL, hash, dept.id]
-    );
-
-    console.log('');
-    console.log('✅  Department head created successfully!');
-    console.log('');
-    console.log(`   Department : ${DEPT_NAME} (id ${dept.id})`);
-    console.log(`   Name       : ${HEAD_NAME}`);
-    console.log(`   Email      : ${HEAD_EMAIL}`);
-    console.log(`   Password   : ${HEAD_PASSWORD}`);
-    console.log(`   Head ID    : ${r.insertId}`);
-    console.log('');
-    console.log('Login at /department-head');
-  } finally {
-    await db.end();
+    console.log('✅ Head created:', EMAIL, '→', DEPT_NAME);
+  } catch (err) {
+    console.error('❌ Failed:', err.message);
+    process.exitCode = 1;
   }
 })();
