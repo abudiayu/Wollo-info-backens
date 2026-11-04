@@ -3,18 +3,17 @@
  * src/routes/motivations.js
  *
  * Admin + department-head CRUD for the `motivations` table.
- * The POST handler uses a direct adminClient insert — no RPC dependency.
  *
  * Mounted at /api/motivations in src/server.js.
  *
- * GET    /api/motivations           — admin: all rows (filterable); head: own dept; else: published only
- * GET    /api/motivations/:id       — single row (auth required)
- * POST   /api/motivations           — create (admin or head)
- * PUT    /api/motivations/:id       — update (admin or head — head scoped to own dept)
- * PATCH  /api/motivations/:id/publish   — set status = 'published'
- * PATCH  /api/motivations/:id/unpublish — set status = 'draft'
- * PATCH  /api/motivations/:id/archive   — set status = 'archived'
- * DELETE /api/motivations/:id       — delete (admin or head — head scoped to own dept)
+ * GET    /api/motivations                 — admin: all; head: own dept; else: published only
+ * GET    /api/motivations/:id             — single row (auth required)
+ * POST   /api/motivations                 — create (admin or head)
+ * PUT    /api/motivations/:id             — update (admin or head — head scoped to own dept)
+ * PATCH  /api/motivations/:id/publish     — set status = 'published'
+ * PATCH  /api/motivations/:id/unpublish   — set status = 'draft'
+ * PATCH  /api/motivations/:id/archive     — set status = 'archived'
+ * DELETE /api/motivations/:id             — delete (admin or head — head scoped to own dept)
  */
 
 const express        = require('express');
@@ -24,6 +23,26 @@ const { requireRole } = require('../middleware/roleGuard');
 
 const router = express.Router();
 
+/**
+ * Build a consistent error response from a Supabase error object.
+ * Always logs the full error server-side so nothing is hidden.
+ */
+function supabaseError(res, error, context = '') {
+  const full = {
+    code:    error?.code    || 'DB_ERROR',
+    message: error?.message || 'Unknown database error',
+    details: error?.details || null,
+    hint:    error?.hint    || null,
+  };
+  console.error(`[motivations${context ? ' ' + context : ''}] Supabase error:`, full);
+  return res.status(500).json({
+    error:   full.message,
+    code:    full.code,
+    details: full.details,
+    hint:    full.hint,
+  });
+}
+
 // ── GET /api/motivations ──────────────────────────────────────
 router.get('/', authMiddleware, async (req, res) => {
   const { department_id, status, search } = req.query;
@@ -32,16 +51,12 @@ router.get('/', authMiddleware, async (req, res) => {
     .from('motivations')
     .select('id, title, details, media_url, status, department_id, created_by, created_at, updated_at');
 
-  // Row visibility rules
   if (req.role === 'admin') {
-    // Admin sees all rows; optionally filter by status
     if (status) q = q.eq('status', status);
   } else if (req.role === 'head') {
-    // Head sees only their department's rows
     q = q.eq('department_id', req.departmentId);
     if (status) q = q.eq('status', status);
   } else {
-    // Any other authenticated user sees only published rows
     q = q.eq('status', 'published');
   }
 
@@ -49,10 +64,7 @@ router.get('/', authMiddleware, async (req, res) => {
   if (search?.trim()) q = q.ilike('title', `%${search.trim()}%`);
 
   const { data, error } = await q.order('created_at', { ascending: false });
-  if (error) {
-    console.error('[GET /api/motivations] Supabase error:', { code: error.code, message: error.message, hint: error.hint });
-    return res.status(500).json({ error: error.message, code: error.code || 'DB_ERROR', hint: error.hint || null });
-  }
+  if (error) return supabaseError(res, error, 'GET /');
   return res.json(data || []);
 });
 
@@ -63,13 +75,12 @@ router.get('/:id', authMiddleware, async (req, res) => {
     .select('*')
     .eq('id', req.params.id)
     .maybeSingle();
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
+  if (error) return supabaseError(res, error, `GET /${req.params.id}`);
   if (!data)  return res.status(404).json({ error: 'Not found.', code: 'NOT_FOUND' });
   return res.json(data);
 });
 
 // ── POST /api/motivations ─────────────────────────────────────
-// Direct insert — no RPC needed.
 router.post('/', authMiddleware, requireRole('admin', 'head'), async (req, res) => {
   const { title, details, media_url, department_id, status = 'draft' } = req.body || {};
 
@@ -78,9 +89,11 @@ router.post('/', authMiddleware, requireRole('admin', 'head'), async (req, res) 
 
   const validStatuses = ['draft', 'published', 'archived'];
   if (!validStatuses.includes(status))
-    return res.status(400).json({ error: `status must be one of: ${validStatuses.join(', ')}.`, code: 'VALIDATION_ERROR' });
+    return res.status(400).json({
+      error: `status must be one of: ${validStatuses.join(', ')}.`,
+      code:  'VALIDATION_ERROR',
+    });
 
-  // Heads can only create for their own department
   const deptId = req.role === 'head' ? req.departmentId : (department_id || null);
 
   const { data, error } = await adminClient
@@ -96,27 +109,26 @@ router.post('/', authMiddleware, requireRole('admin', 'head'), async (req, res) 
     .select()
     .single();
 
-  if (error) {
-    console.error('[POST /api/motivations]', error);
-    return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
-  }
+  if (error) return supabaseError(res, error, 'POST /');
   return res.status(201).json(data);
 });
 
 // ── PUT /api/motivations/:id ──────────────────────────────────
 router.put('/:id', authMiddleware, requireRole('admin', 'head'), async (req, res) => {
-  // Verify the row exists and check ownership for heads
   const { data: existing, error: fetchErr } = await adminClient
     .from('motivations')
     .select('id, department_id')
     .eq('id', req.params.id)
     .maybeSingle();
 
-  if (fetchErr) return res.status(500).json({ error: fetchErr.message, code: 'DB_ERROR' });
+  if (fetchErr) return supabaseError(res, fetchErr, `PUT /${req.params.id} (fetch)`);
   if (!existing) return res.status(404).json({ error: 'Not found.', code: 'NOT_FOUND' });
 
   if (req.role === 'head' && existing.department_id !== req.departmentId)
-    return res.status(403).json({ error: 'You can only edit your own department\'s motivations.', code: 'AUTHZ_WRONG_DEPT' });
+    return res.status(403).json({
+      error: "You can only edit your own department's motivations.",
+      code:  'AUTHZ_WRONG_DEPT',
+    });
 
   const { title, details, media_url, status } = req.body || {};
   const patch = {};
@@ -126,7 +138,10 @@ router.put('/:id', authMiddleware, requireRole('admin', 'head'), async (req, res
   if (status    !== undefined) {
     const valid = ['draft', 'published', 'archived'];
     if (!valid.includes(status))
-      return res.status(400).json({ error: `status must be one of: ${valid.join(', ')}.`, code: 'VALIDATION_ERROR' });
+      return res.status(400).json({
+        error: `status must be one of: ${valid.join(', ')}.`,
+        code:  'VALIDATION_ERROR',
+      });
     patch.status = status;
   }
 
@@ -140,7 +155,7 @@ router.put('/:id', authMiddleware, requireRole('admin', 'head'), async (req, res
     .select()
     .single();
 
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
+  if (error) return supabaseError(res, error, `PUT /${req.params.id}`);
   return res.json(data);
 });
 
@@ -152,7 +167,7 @@ router.patch('/:id/publish', authMiddleware, requireRole('admin', 'head'), async
     .eq('id', req.params.id)
     .select('id, status')
     .single();
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
+  if (error) return supabaseError(res, error, `PATCH /${req.params.id}/publish`);
   return res.json({ success: true, status: 'published', id: data?.id });
 });
 
@@ -164,7 +179,7 @@ router.patch('/:id/unpublish', authMiddleware, requireRole('admin', 'head'), asy
     .eq('id', req.params.id)
     .select('id, status')
     .single();
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
+  if (error) return supabaseError(res, error, `PATCH /${req.params.id}/unpublish`);
   return res.json({ success: true, status: 'draft', id: data?.id });
 });
 
@@ -176,31 +191,33 @@ router.patch('/:id/archive', authMiddleware, requireRole('admin', 'head'), async
     .eq('id', req.params.id)
     .select('id, status')
     .single();
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
+  if (error) return supabaseError(res, error, `PATCH /${req.params.id}/archive`);
   return res.json({ success: true, status: 'archived', id: data?.id });
 });
 
 // ── DELETE /api/motivations/:id ───────────────────────────────
 router.delete('/:id', authMiddleware, requireRole('admin', 'head'), async (req, res) => {
-  // Check existence and ownership
   const { data: existing, error: fetchErr } = await adminClient
     .from('motivations')
     .select('id, department_id')
     .eq('id', req.params.id)
     .maybeSingle();
 
-  if (fetchErr) return res.status(500).json({ error: fetchErr.message, code: 'DB_ERROR' });
+  if (fetchErr) return supabaseError(res, fetchErr, `DELETE /${req.params.id} (fetch)`);
   if (!existing) return res.status(404).json({ error: 'Not found.', code: 'NOT_FOUND' });
 
   if (req.role === 'head' && existing.department_id !== req.departmentId)
-    return res.status(403).json({ error: 'You can only delete your own department\'s motivations.', code: 'AUTHZ_WRONG_DEPT' });
+    return res.status(403).json({
+      error: "You can only delete your own department's motivations.",
+      code:  'AUTHZ_WRONG_DEPT',
+    });
 
   const { error } = await adminClient
     .from('motivations')
     .delete()
     .eq('id', req.params.id);
 
-  if (error) return res.status(500).json({ error: error.message, code: 'DB_ERROR' });
+  if (error) return supabaseError(res, error, `DELETE /${req.params.id}`);
   return res.json({ success: true });
 });
 
